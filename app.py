@@ -8,10 +8,16 @@ import tempfile
 from pathlib import Path
 from typing import List, Tuple
 
+import math
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import streamlit as st
+
+# Email (Gmail SMTP)
+import smtplib
+import ssl
+from email.message import EmailMessage
 
 # -----------------------------
 # Page / Theme
@@ -19,16 +25,11 @@ import streamlit as st
 st.set_page_config(page_title="Semester Feedback Dashboard", page_icon="📝", layout="wide")
 st.markdown("""
 <style>
-/* Simple, clean styling */
 .main > div { padding-top: 1rem; }
 .block-container { padding-top: 1rem; }
 h1, h2, h3 { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
-div[data-testid="stExpander"] div[role="button"] p {
-  font-weight: 600 !important;
-}
-.plot-caption {
-  font-size: 0.85rem; opacity: 0.8; margin-top: -0.25rem;
-}
+div[data-testid="stExpander"] div[role="button"] p { font-weight: 600 !important; }
+.plot-caption { font-size: 0.85rem; opacity: 0.8; margin-top: -0.25rem; }
 hr { margin: 1rem 0; }
 .badge { display: inline-block; padding: 4px 8px; border-radius: 999px; background: #EEF2FF; color: #3730A3; font-size: 12px; margin-left: 8px; }
 </style>
@@ -79,6 +80,9 @@ REQUIRED_COLUMNS = [
     "onlinenavigation","onlinesuccess","commentsonline","combine"
 ]
 
+# Gmail nominal max ~25MB; base64 adds ~33%. Keep attachment <= ~17MB to be safe.
+MAX_EMAIL_BYTES = 17 * 1024 * 1024  # 17 MiB
+
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -92,13 +96,11 @@ def annotate_percent(ax, counts, denom):
         ax.text(i, v + (max(counts) * 0.02 if counts else 0.1), f"{pct:.1f}%", ha="center", va="bottom", fontsize=9)
 
 def plot_likert_bar(dq: pd.DataFrame, col: str, title: str, denom_total: int):
-    # Count per ordered category
     counts = [(dq[dq[col] == label][col]).count() for label in LIKERT_ORDER]
-    x = np.arange(len(LIKERT_ORDER))
     fig, ax = plt.subplots()
     ax.bar(LIKERT_ORDER, counts)
     ax.set_title(title)
-    ax.set_xlabel("")  # keep clean
+    ax.set_xlabel("")
     ax.set_ylabel("Responses")
     annotate_percent(ax, counts, denom_total)
     ax.tick_params(axis='x', labelrotation=20)
@@ -112,70 +114,112 @@ def save_fig(fig, out_dir: Path, filename: str) -> Path:
     plt.close(fig)
     return out_path
 
-def zip_dir_bytes(dir_path: Path) -> bytes:
+def zip_dir_bytes(dir_path: Path, only_ext: List[str] | None = None) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         for p in dir_path.rglob("*"):
             if p.is_file():
+                if only_ext:
+                    if p.suffix.lower() not in [e.lower() for e in only_ext]:
+                        continue
                 zf.write(p, arcname=p.relative_to(dir_path))
     buffer.seek(0)
     return buffer.read()
 
-def open_email_with_attachments(subject: str, body: str, attachment_paths: List[Path]):
-    system = platform.system().lower()
+def make_zip_from_files(files: List[Path], zip_path: Path) -> Path:
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in files:
+            zf.write(f, arcname=f.name)
+    return zip_path
 
-    if system.startswith("win"):
-        try:
-            import win32com.client as win32  # Requires: pip install pywin32
-        except Exception as e:
-            st.error("pywin32 is not installed. Run: `pip install pywin32`")
-            return
-        try:
-            outlook = win32.Dispatch("Outlook.Application")
-            mail = outlook.CreateItem(0)  # 0 = olMailItem
-            mail.Subject = subject
-            mail.Body = body
-            for p in attachment_paths:
-                mail.Attachments.Add(p.as_posix())
-            mail.Display()  # opens compose window (does not send)
-            st.success("Opened Outlook compose window.")
-        except Exception as e:
-            st.error(f"Unable to open Outlook compose window: {e}")
-    elif system == "darwin":
-        # macOS Apple Mail via AppleScript
-        # We create a temporary AppleScript that opens a new message and attaches files
-        try:
-            # Escape file paths for AppleScript
-            attachments_applescript = ""
-            for p in attachment_paths:
-                # Convert to POSIX path string and escape quotes
-                attachments_applescript += f'set end of theAttachments to POSIX file "{p.as_posix()}"\n'
+def base64_encoded_size(byte_len: int) -> int:
+    """Return size after base64 (approx 4/3 growth)."""
+    return math.ceil(byte_len / 3) * 4 + 50_000  # small header fudge
 
-            script = f'''
-            tell application "Mail"
-                activate
-                set theMessage to make new outgoing message with properties {{subject:"{subject}", content:"{body}\\n"}}
-                tell theMessage
-                    set visible to true
-                    set theAttachments to {{}}
-                    {attachments_applescript}
-                    repeat with f in theAttachments
-                        try
-                            make new attachment with properties {{file name:f}} at after the last paragraph
-                        end try
-                    end repeat
-                end tell
-            end tell
-            '''
-            with tempfile.NamedTemporaryFile(suffix=".applescript", delete=False, mode="w") as tmp:
-                tmp.write(script)
-                tmp_path = tmp.name
-            os.system(f'osascript "{tmp_path}"')
-            st.success("Opened Apple Mail compose window.")
-        except Exception as e:
-            st.error(f"Unable to open Apple Mail compose window: {e}")
-    else:
-        st.info("Email compose automation is supported on Windows (Outlook) and macOS (Apple Mail) only.")
+def batch_files_for_zip(files: List[Path], max_encoded_bytes: int) -> List[List[Path]]:
+    """
+    Greedy-pack files into batches so each resulting ZIP (after base64)
+    stays under max_encoded_bytes. We approximate using sum of raw sizes
+    and verify below when building actual zips.
+    """
+    # Conservative factor: ZIP compression is unknown; PNG is already compressed, TXT compresses well.
+    # We'll estimate zip size roughly as sum(raw) * 1.05 (zip headers), then base64 growth.
+    def est_encoded_zip_size(raw_sum: int) -> int:
+        estimated_zip = int(raw_sum * 1.05)  # 5% overhead guess
+        return base64_encoded_size(estimated_zip)
+
+    batches = []
+    cur, cur_raw = [], 0
+    for f in files:
+        sz = f.stat().st_size
+        if est_encoded_zip_size(sz) > max_encoded_bytes:
+            # Single file too big (unlikely for PNG/TXT). Put alone.
+            if cur:
+                batches.append(cur)
+                cur, cur_raw = [], 0
+            batches.append([f])
+            continue
+        if cur and est_encoded_zip_size(cur_raw + sz) > max_encoded_bytes:
+            batches.append(cur)
+            cur, cur_raw = [], 0
+        cur.append(f)
+        cur_raw += sz
+    if cur:
+        batches.append(cur)
+    return batches
+
+def refine_batches_to_fit(files: List[Path], max_encoded_bytes: int, safe_folder: str) -> List[Path]:
+    """
+    Build zips from approximate batches; if any zip still exceeds the budget, split further.
+    Returns list of created zip file paths.
+    """
+    zips: List[Path] = []
+    batches = batch_files_for_zip(files, max_encoded_bytes)
+    tmp_root = Path(tempfile.gettempdir()) / f"email_zips_{safe_folder}"
+    tmp_root.mkdir(parents=True, exist_ok=True)
+
+    for idx, batch in enumerate(batches, start=1):
+        # Try building a zip; if too big encoded, split batch and retry
+        stack = [(idx, batch)]
+        part_counter = 0
+        while stack:
+            tag, group = stack.pop()
+            part_counter += 1
+            zip_path = tmp_root / f"{safe_folder}_{tag}_{part_counter}.zip"
+            make_zip_from_files(group, zip_path)
+            raw = zip_path.stat().st_size
+            enc = base64_encoded_size(raw)
+            if enc <= max_encoded_bytes or len(group) == 1:
+                zips.append(zip_path)
+            else:
+                # Split group roughly in half and retry
+                mid = max(1, len(group) // 2)
+                left, right = group[:mid], group[mid:]
+                # push right then left so left is processed first
+                stack.append((f"{tag}b", right))
+                stack.append((f"{tag}a", left))
+    return zips
+
+def send_email_gmail_zips(to_emails: List[str], subject: str, body: str, zip_paths: List[Path]):
+    sender = st.secrets["GMAIL_ADDRESS"]
+    password = st.secrets["GMAIL_APP_PASSWORD"]
+
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
+        server.login(sender, password)
+        total = len(zip_paths)
+        for i, z in enumerate(zip_paths, start=1):
+            msg = EmailMessage()
+            suffix = f" (part {i}/{total})" if total > 1 else ""
+            msg["From"] = sender
+            msg["To"] = ", ".join(to_emails)
+            msg["Subject"] = subject + suffix
+            msg.set_content(body + (f"\n\nThis is {i} of {total}." if total > 1 else ""))
+            with open(z, "rb") as fh:
+                data = fh.read()
+            msg.add_attachment(data, maintype="application", subtype="zip", filename=z.name)
+            server.send_message(msg)
 
 # -----------------------------
 # UI: Header & Uploader
@@ -231,10 +275,12 @@ for feedback in sorted(combine_list):
     out_dir = base_dir / safe_folder
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    with st.expander(f"📦 {feedback}  "
-                     f"<span class='badge'>Lecturer: {lecturer}</span>  "
-                     f"<span class='badge'>Module: {modulecode} - {modulename}</span>  "
-                     f"<span class='badge'>Responses: {size}</span>", expanded=False):
+    with st.expander(
+        f"📦 {feedback}  "
+        f"<span class='badge'>Lecturer: {lecturer}</span>  "
+        f"<span class='badge'>Module: {modulecode} - {modulename}</span>  "
+        f"<span class='badge'>Responses: {size}</span>", expanded=False
+    ):
         st.markdown("---")
         st.subheader("Likert Plots")
 
@@ -244,12 +290,12 @@ for feedback in sorted(combine_list):
             if i % cols_per_row == 0:
                 row_cols = st.columns(cols_per_row, vertical_alignment="center")
 
-            denom = size  # match original logic: percentage uses total SIZENO for the section
+            denom = size  # percent uses total size for the section
             fig, counts = plot_likert_bar(dq, col, label, denom_total=denom)
 
             # Save PNG to the per-combine folder
             filename = f"{i:02d}_{col}.png"
-            png_path = save_fig(fig, out_dir, filename)
+            _ = save_fig(fig, out_dir, filename)
 
             # Show plot
             with row_cols[i % cols_per_row]:
@@ -258,14 +304,13 @@ for feedback in sorted(combine_list):
 
         st.markdown("---")
 
-        # Text comments (optional display + save to files like original)
+        # Text comments
         st.subheader("Comments")
         comments_tabs = st.tabs(TEXT_COMMENT_DESCRIPTIONS)
         for t_idx, (tcol, tdesc) in enumerate(zip(TEXT_COMMENT_COLUMNS, TEXT_COMMENT_DESCRIPTIONS)):
-            # Gather non-empty, stripped unique comments
             comments_series = dq[tcol].dropna().astype(str).map(str.strip)
             comments = [c for c in comments_series.unique() if c]
-            # Save to text file inside the same folder
+            # Save to text file
             txt_path = out_dir / f"{tcol}.txt"
             with open(txt_path, "w", encoding="utf-8", newline="") as f:
                 for line in comments:
@@ -281,36 +326,55 @@ for feedback in sorted(combine_list):
 
         st.markdown("---")
 
-        # Download ZIP (named after 'combine')
-        zip_bytes = zip_dir_bytes(out_dir)
+        # Build a downloadable ZIP (PNG + TXT only)
+        zip_bytes = zip_dir_bytes(out_dir, only_ext=[".png", ".txt"])
         zip_name = f"{safe_folder}.zip" if safe_folder else "plots.zip"
         st.download_button(
-            label=f"📥 Download all plots & comments for '{feedback}'",
+            label=f"📥 Download ZIP for '{feedback}'",
             data=zip_bytes,
             file_name=zip_name,
             mime="application/zip",
-            help="Downloads a zip folder containing all PNG plots and the three comments text files."
         )
 
-        # Email button (desktop only)
-        st.markdown("#### Email these plots")
-        st.caption("This opens your desktop email app with the PNGs attached (Windows: Outlook via MAPI, macOS: Apple Mail).")
-        col_email1, col_email2 = st.columns([1, 3])
-        with col_email1:
-            do_email = st.button(f"✉️ Open compose window for '{feedback}'")
-        with col_email2:
-            default_subject = f"Lecturer feedback plots - {feedback}"
-            subject = st.text_input("Email Subject", value=default_subject, key=f"subj_{safe_folder}")
-            body = st.text_area("Email Body", value="Hi,\n\nPlease see the attached feedback plots.\n\nThanks.", key=f"body_{safe_folder}", height=100)
+        # -----------------------------
+        # Instant send via Gmail (ZIP only)
+        # -----------------------------
+        st.markdown("#### Send ZIP via Gmail (instant)")
+        st.caption("Attaches a ZIP (PNG plots + TXT comments). If too large, the app will split into multiple emails automatically.")
 
-        if do_email:
-            # Collect attachments (PNGs only, like your requirement)
-            attachment_paths = sorted(out_dir.glob("*.png"))
-            if not attachment_paths:
-                st.warning("No PNG plots found to attach.")
-            else:
-                open_email_with_attachments(subject, body, attachment_paths)
+        col1, col2 = st.columns([2, 3])
+        with col1:
+            to_emails_raw = st.text_input("Recipient email(s) (comma-separated)", value="", key=f"to_{safe_folder}")
+        with col2:
+            subject = st.text_input("Email Subject", value=f"Lecturer feedback plots - {feedback}", key=f"subj_{safe_folder}")
+        body = st.text_area(
+            "Email Body",
+            value="Hi,\n\nPlease see the attached feedback ZIP.\n\nThanks.",
+            key=f"body_{safe_folder}",
+            height=100
+        )
+
+        if st.button(f"🚀 Send ZIP now for '{feedback}'", key=f"send_{safe_folder}"):
+            try:
+                recipients = [x.strip() for x in to_emails_raw.split(",") if x.strip()]
+                if not recipients:
+                    st.warning("Please enter at least one recipient email.")
+                else:
+                    # Gather files to include in ZIPs
+                    files_for_zip = sorted(list(out_dir.glob("*.png")) + list(out_dir.glob("*.txt")))
+                    if not files_for_zip:
+                        st.warning("No PNG/TXT files found to include in ZIP.")
+                    else:
+                        # Create size-safe zip parts
+                        zip_paths = refine_batches_to_fit(files_for_zip, MAX_EMAIL_BYTES, safe_folder or "plots")
+                        # Send one email per zip part
+                        send_email_gmail_zips(recipients, subject, body, zip_paths)
+                        st.success("Email(s) with ZIP sent successfully ✅")
+            except KeyError:
+                st.error("Gmail is not configured. Add GMAIL_ADDRESS and GMAIL_APP_PASSWORD to .streamlit/secrets.toml")
+            except Exception as e:
+                st.error(f"Failed to send email: {e}")
 
 # Footer
 st.markdown("---")
-st.caption("Built with Streamlit • Plots generated with Matplotlib • CSV format aligned with your original script")
+st.caption("Built with Streamlit • Plots generated with Matplotlib • Instant Gmail ZIP sending")
